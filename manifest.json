@@ -11,7 +11,7 @@
     "storage"
   ],
   "background": {
-    "service_worker": "src/background/index.ts",
+    "service_worker": "background.js",
     "type": "module"
   },
   "side_panel": {
@@ -31,3 +31,4 @@
     }
   ]
 }
+

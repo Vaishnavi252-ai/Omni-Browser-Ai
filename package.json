@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b && npm run build:background && npm run build:crx",
+    "build:background": "vite build --config vite.background.config.ts",
+    "build:crx": "vite build --config vite.config.ts --emptyOutDir false",
     "lint": "eslint .",
     "preview": "vite preview"
   },
