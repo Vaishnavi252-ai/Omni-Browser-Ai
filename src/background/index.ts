@@ -31,7 +31,12 @@ async function setupOffscreenContext() {
 
 chrome.runtime.onMessage.addListener(
   (message: any, _sender: any, sendResponse: (response?: any) => void) => {
-    if (!message || (message.type !== 'TAB_SCRAPED_DATA' && message.type !== 'RUN_LOCAL_INFERENCE')) {
+    if (!message) {
+      return false;
+    }
+
+    const allowedTypes = ['TAB_SCRAPED_DATA', 'RUN_LOCAL_INFERENCE', 'PURGE_ALL_DATA', 'RESET_OFFSCREEN'];
+    if (!allowedTypes.includes(message.type)) {
       return false;
     }
 
