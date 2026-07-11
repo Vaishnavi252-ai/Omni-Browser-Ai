@@ -14,6 +14,27 @@ type TabContextItem = {
   enabled: boolean;
 };
 
+const parseEngineProgress = (status?: string) => {
+  if (!status) {
+    return 0;
+  }
+
+  const percentMatch = status.match(/(\d{1,3})\s*%/i);
+  if (percentMatch) {
+    return Math.min(100, Math.max(0, Number(percentMatch[1])));
+  }
+
+  if (/complete|ready|loaded|done/i.test(status)) {
+    return 100;
+  }
+
+  if (/download|loading|initializing|compile|model/i.test(status)) {
+    return 25;
+  }
+
+  return 0;
+};
+
 const initialTabs: TabContextItem[] = [
   { id: 1, title: 'Hackathon Brief', url: 'https://example.com/brief', enabled: true },
   { id: 2, title: 'Research Notes', url: 'https://example.com/notes', enabled: true },
@@ -27,19 +48,47 @@ function App() {
   const [answer, setAnswer] = useState('');
   const [citations, setCitations] = useState<Citation[]>([]);
   const [statusText, setStatusText] = useState('Ready to reason locally.');
+  const [engineProgress, setEngineProgress] = useState(0);
+  const [isInferenceRunning, setIsInferenceRunning] = useState(false);
+  const [isConfirmOpen, setIsConfirmOpen] = useState(false);
+  const [isResetting, setIsResetting] = useState(false);
+  const [uiError, setUiError] = useState<string | null>(null);
   const [tabs, setTabs] = useState(initialTabs);
   const [batteryMode, setBatteryMode] = useState<'low' | 'deep'>('deep');
 
   useEffect(() => {
     const listener = (message: any) => {
-      if (message?.type === 'ENGINE_COMPILE_STATUS') {
-        setStatusText(message.status || 'Preparing local engine…');
+      if (!message?.type) {
+        return;
       }
 
-      if (message?.type === 'INFERENCE_COMPLETE_RESPONSE') {
+      if (message.type === 'ENGINE_COMPILE_STATUS') {
+        const nextProgress = parseEngineProgress(message.status);
+        setEngineProgress(nextProgress);
+        setStatusText(message.status || 'Preparing local engine…');
+        return;
+      }
+
+      if (message.type === 'INFERENCE_COMPLETE_RESPONSE') {
         setAnswer(message.answer || 'No answer generated.');
         setCitations(message.citations || []);
         setStatusText('Inference completed locally.');
+        setEngineProgress(100);
+        setIsInferenceRunning(false);
+        setUiError(null);
+        return;
+      }
+
+      if (message.type === 'INFERENCE_ERROR' || message.type === 'ENGINE_LOAD_ERROR') {
+        setStatusText(message.error || 'Inference failed.');
+        setUiError(message.error || 'The local engine could not complete the request.');
+        setIsInferenceRunning(false);
+        setIsResetting(false);
+      }
+
+      if (message.type === 'PURGE_ALL_DATA_SUCCESS') {
+        setStatusText('Local memory caches wiped.');
+        setUiError(null);
       }
     };
 
@@ -48,10 +97,67 @@ function App() {
   }, []);
 
   const handleRunInference = () => {
+    if (!inputValue.trim()) {
+      setStatusText('Type a question before running the local engine.');
+      return;
+    }
+
+    setIsInferenceRunning(true);
+    setUiError(null);
     setStatusText('Dispatching local query…');
-    chrome.runtime.sendMessage({
-      type: 'RUN_LOCAL_INFERENCE',
-      query: inputValue,
+    chrome.runtime?.sendMessage(
+      {
+        type: 'RUN_LOCAL_INFERENCE',
+        query: inputValue.trim(),
+      },
+      (response: any) => {
+        if (chrome.runtime.lastError) {
+          setUiError(chrome.runtime.lastError.message || 'The request could not be delivered.');
+          setIsInferenceRunning(false);
+          return;
+        }
+
+        if (response?.status === 'ERROR') {
+          setUiError(response.error || 'Inference failed.');
+          setIsInferenceRunning(false);
+        }
+      },
+    );
+  };
+
+  const handleResetEngine = () => {
+    setIsResetting(true);
+    setUiError(null);
+    setStatusText('Resetting offscreen engine…');
+    chrome.runtime?.sendMessage({ type: 'RESET_OFFSCREEN' }, (response: any) => {
+      if (chrome.runtime.lastError) {
+        setUiError(chrome.runtime.lastError.message || 'The engine reset could not be completed.');
+        setIsResetting(false);
+        return;
+      }
+
+      setEngineProgress(0);
+      setStatusText(response?.status === 'RESET_COMPLETE' ? 'Engine reset complete. Ready to retry.' : 'Engine reset requested.');
+      setIsResetting(false);
+    });
+  };
+
+  const confirmPurge = () => {
+    setIsConfirmOpen(false);
+    setStatusText('Purging local memory…');
+    setAnswer('');
+    setCitations([]);
+    setEngineProgress(0);
+    chrome.runtime?.sendMessage({ type: 'PURGE_ALL_DATA' }, (response: any) => {
+      if (chrome.runtime.lastError) {
+        setUiError(chrome.runtime.lastError.message || 'Could not purge the local memory cache.');
+        return;
+      }
+
+      if (response?.status === 'PURGED') {
+        setStatusText('Local memory caches wiped.');
+        setUiError(null);
+      }
     });
   };
 
@@ -87,6 +193,21 @@ function App() {
             </div>
           </div>
         </header>
+
+        {uiError && (
+          <div className="mb-3 rounded-2xl border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-100">
+            <div className="font-medium">Runtime guardrail triggered</div>
+            <div className="mt-1 text-red-100/80">{uiError}</div>
+            <button
+              type="button"
+              onClick={handleResetEngine}
+              disabled={isResetting}
+              className="mt-3 rounded-xl border border-red-400/30 bg-red-600/20 px-3 py-2 text-sm font-semibold text-red-100 transition hover:bg-red-600/30 disabled:cursor-not-allowed disabled:opacity-70"
+            >
+              {isResetting ? 'Resetting…' : 'System Reset'}
+            </button>
+          </div>
+        )}
 
         <nav className="mb-3 grid grid-cols-3 gap-2 rounded-2xl border border-white/10 bg-[#111622]/70 p-2">
           {[
@@ -133,11 +254,25 @@ function App() {
                   <button
                     type="button"
                     onClick={handleRunInference}
-                    className="rounded-xl bg-[#FF6B00] px-4 py-2 text-sm font-semibold text-white transition hover:brightness-110"
+                    disabled={isInferenceRunning}
+                    className="rounded-xl bg-[#FF6B00] px-4 py-2 text-sm font-semibold text-white transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-70"
                   >
-                    Run local inference
+                    {isInferenceRunning ? 'Running…' : 'RUN ⚡'}
                   </button>
                   <span className="text-sm text-slate-500">Works fully offline when the engine is loaded.</span>
+                </div>
+                <div className="mt-4 rounded-xl border border-white/10 bg-[#0E1420] p-3">
+                  <div className="mb-3 flex items-center justify-between text-sm">
+                    <span className="font-medium text-slate-300">Engine compile status</span>
+                    <span className="text-slate-400">{engineProgress}%</span>
+                  </div>
+                  <div className="h-2 overflow-hidden rounded-full bg-slate-800">
+                    <div
+                      className="h-full rounded-full bg-gradient-to-r from-[#FF6B00] to-[#8B5CF6] transition-all duration-500 ease-out"
+                      style={{ width: `${Math.max(4, engineProgress)}%` }}
+                    />
+                  </div>
+                  <div className="mt-2 text-xs text-slate-500">{statusText}</div>
                 </div>
                 <div className="mt-4 rounded-xl border border-white/10 bg-[#0E1420] p-3">
                   <div className="mb-2 text-sm font-medium text-slate-300">Answer</div>
@@ -147,15 +282,16 @@ function App() {
                   {citations.length > 0 && (
                     <div className="mt-3 flex flex-wrap gap-2">
                       {citations.map((citation) => (
-                        <a
+                        <button
                           key={`${citation.title}-${citation.url}`}
-                          href={citation.url}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="rounded-full border border-[#FF6B00]/25 bg-[#FF6B00]/10 px-3 py-1 text-sm text-[#FFB17A]"
+                          type="button"
+                          onClick={() => {
+                            void chrome.tabs.update({ url: citation.url, active: true });
+                          }}
+                          className="rounded-full border border-violet-700/50 bg-violet-900/30 px-3 py-1 text-sm text-violet-300 transition hover:bg-violet-800/40"
                         >
                           {citation.title}
-                        </a>
+                        </button>
                       ))}
                     </div>
                   )}
@@ -254,11 +390,7 @@ function App() {
                 </p>
                 <button
                   type="button"
-                  onClick={() => {
-                    setAnswer('');
-                    setCitations([]);
-                    setStatusText('Local memory caches wiped.');
-                  }}
+                  onClick={() => setIsConfirmOpen(true)}
                   className="mt-4 rounded-xl bg-red-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-red-500"
                 >
                   Wipe Local Memory Caches Now
@@ -268,6 +400,33 @@ function App() {
           )}
         </main>
       </div>
+
+      {isConfirmOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4">
+          <div className="w-full max-w-md rounded-2xl border border-red-500/30 bg-[#111622] p-5 shadow-2xl">
+            <div className="text-lg font-semibold text-white">Confirm purge</div>
+            <p className="mt-2 text-sm text-slate-400">
+              This permanently clears the local Orama cache and resets the current inference state. Continue?
+            </p>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setIsConfirmOpen(false)}
+                className="rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-slate-300 transition hover:bg-white/10"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={confirmPurge}
+                className="rounded-xl bg-red-600 px-3 py-2 text-sm font-semibold text-white transition hover:bg-red-500"
+              >
+                Delete Local Memory
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
