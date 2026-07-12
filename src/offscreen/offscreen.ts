@@ -73,6 +73,53 @@ function dedupeCitations(citations: Citation[]): Citation[] {
   });
 }
 
+function getHostname(url: string): string | null {
+  if (!url) {
+    return null;
+  }
+
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+function rankContextHits(hits: SearchHit[], activeTitle: string, activeUrl: string): SearchHit[] {
+  const normalizedActiveTitle = activeTitle.trim().toLowerCase();
+  const activeHostname = getHostname(activeUrl);
+
+  return [...hits].sort((a, b) => {
+    const aScore = getContextHitScore(a.document, normalizedActiveTitle, activeHostname, activeUrl);
+    const bScore = getContextHitScore(b.document, normalizedActiveTitle, activeHostname, activeUrl);
+    return bScore - aScore;
+  });
+}
+
+function getContextHitScore(document: StoredDocument, activeTitle: string, activeHostname: string | null, activeUrl: string): number {
+  const normalizedTitle = document.title.trim().toLowerCase();
+  const hostname = getHostname(document.url);
+  let score = 0;
+
+  if (normalizedTitle && activeTitle && normalizedTitle === activeTitle) {
+    score += 1000;
+  }
+
+  if (normalizedTitle && activeTitle && (normalizedTitle.includes(activeTitle) || activeTitle.includes(normalizedTitle))) {
+    score += 250;
+  }
+
+  if (hostname && activeHostname && hostname === activeHostname) {
+    score += 150;
+  }
+
+  if (document.url && activeUrl && document.url === activeUrl) {
+    score += 500;
+  }
+
+  return score;
+}
+
 function sendRuntimeMessage(message: RuntimeMessage): Promise<void> {
   return new Promise((resolve) => {
     chrome.runtime.sendMessage(message, () => {
@@ -183,13 +230,25 @@ chrome.runtime.onMessage.addListener((message: IngestionMessage, _sender: unknow
           return;
         }
 
+        let activeTitle = '';
+        let activeUrl = '';
+
+        try {
+          const activeTab = await chrome.tabs.query({ active: true, currentWindow: true });
+          activeTitle = activeTab[0]?.title?.trim() ?? '';
+          activeUrl = activeTab[0]?.url ?? '';
+        } catch (error) {
+          console.warn('OmniBrowser AI: failed to read active tab context for retrieval', error);
+        }
+
         const searchResults = (await search(db as never, {
           term: query,
-          limit: 3,
+          limit: 10,
         })) as unknown as SearchResponse;
 
         const hits = searchResults.hits ?? [];
-        const contextBlocks = hits.map((hit) => `[Source: ${hit.document.title}] ${hit.document.text}`);
+        const rankedHits = rankContextHits(hits, activeTitle, activeUrl).slice(0, 3);
+        const contextBlocks = rankedHits.map((hit) => `[Source: ${hit.document.title}] ${hit.document.text}`);
         const contextText = contextBlocks.length > 0 ? contextBlocks.join('\n\n') : 'No relevant tab context was found.';
         const prompt = `You are OmniBrowser AI. Answer the user's question using only the supplied context. If the context is insufficient, say so clearly.\n\nContext:\n${contextText}\n\nQuestion: ${query}\n\nAnswer:`;
 
@@ -208,7 +267,7 @@ chrome.runtime.onMessage.addListener((message: IngestionMessage, _sender: unknow
 
         const answer = output.choices?.[0]?.message?.content ?? 'No answer generated.';
         const citations = dedupeCitations(
-          hits.map((hit) => ({
+          rankedHits.map((hit) => ({
             title: hit.document.title,
             url: hit.document.url,
           })),

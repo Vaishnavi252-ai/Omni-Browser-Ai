@@ -1,18 +1,20 @@
 import { useEffect, useMemo, useState } from 'react';
 
-type WorkspaceTab = 'chat' | 'data' | 'settings';
+
 
 type Citation = {
   title: string;
   url: string;
 };
 
-type TabContextItem = {
-  id: number;
-  title: string;
-  url: string;
-  enabled: boolean;
+type ChatMessage = {
+  id: string;
+  role: 'user' | 'assistant';
+  text: string;
+  timestamp: number;
+  citations: Citation[];
 };
+
 
 const parseEngineProgress = (status?: string) => {
   if (!status) {
@@ -35,32 +37,62 @@ const parseEngineProgress = (status?: string) => {
   return 0;
 };
 
-const initialTabs: TabContextItem[] = [
-  { id: 1, title: 'Hackathon Brief', url: 'https://example.com/brief', enabled: true },
-  { id: 2, title: 'Research Notes', url: 'https://example.com/notes', enabled: true },
-  { id: 3, title: 'Design System', url: 'https://example.com/design', enabled: false },
-  { id: 4, title: 'Judge Demo Flow', url: 'https://example.com/demo', enabled: true },
-];
-
 function App() {
-  const [activeTab, setActiveTab] = useState<WorkspaceTab>('chat');
+  const [activeTab, setActiveTab] = useState<'chat' | 'data' | 'settings'>('chat');
   const [inputValue, setInputValue] = useState('Summarize the most relevant context from my open tabs.');
+
+  // Existing UI state (kept so the rest of the app remains stable)
   const [answer, setAnswer] = useState('');
   const [citations, setCitations] = useState<Citation[]>([]);
+
+  // New persistent chat history
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+
   const [statusText, setStatusText] = useState('Ready to reason locally.');
   const [engineProgress, setEngineProgress] = useState(0);
   const [isInferenceRunning, setIsInferenceRunning] = useState(false);
   const [isConfirmOpen, setIsConfirmOpen] = useState(false);
   const [isResetting, setIsResetting] = useState(false);
   const [uiError, setUiError] = useState<string | null>(null);
-  const [tabs, setTabs] = useState(initialTabs);
+  // Legacy placeholder state (no longer used; retained only for UI stability)
+  // const [tabs, setTabs] = useState(initialTabs);
+
   const [batteryMode, setBatteryMode] = useState<'low' | 'deep'>('deep');
+
+  // Dynamic Data Hub Matrix state (fed by chrome.runtime MESSAGE: MATRIX_CONTEXT_PULSE)
+  const [totalTabs, setTotalTabs] = useState(0);
+  const [indexedTabs, setIndexedTabs] = useState(0);
+  const [tabMatrixList, setTabMatrixList] = useState<{ id: number; title: string; url: string }[]>([]);
+  const [selectedTabIds, setSelectedTabIds] = useState<number[]>([]);
+
+  useEffect(() => {
+    const matrixPulseListener = (message: any) => {
+      if (message?.type === 'MATRIX_CONTEXT_PULSE') {
+        setTotalTabs(message.totalTabsCount ?? 0);
+        setIndexedTabs(message.indexedCount ?? 0);
+        setTabMatrixList(message.tabsMetadata ?? []);
+
+        // Auto-select all tabs on first load if nothing is selected yet
+        if ((selectedTabIds?.length ?? 0) === 0) {
+          setSelectedTabIds((message.tabsMetadata ?? []).map((t: any) => t.id));
+        }
+      }
+    };
+
+    chrome.runtime.onMessage.addListener(matrixPulseListener);
+    return () => chrome.runtime.onMessage.removeListener(matrixPulseListener);
+  }, [selectedTabIds]);
+
+  const handleToggleTab = (tabId: number) => {
+    setSelectedTabIds((prev) => (prev.includes(tabId) ? prev.filter((id) => id !== tabId) : [...prev, tabId]));
+  };
 
   useEffect(() => {
     const listener = (message: any) => {
       if (!message?.type) {
         return;
       }
+
 
       if (message.type === 'ENGINE_COMPILE_STATUS') {
         const nextProgress = parseEngineProgress(message.status);
@@ -70,12 +102,33 @@ function App() {
       }
 
       if (message.type === 'INFERENCE_COMPLETE_RESPONSE') {
-        setAnswer(message.answer || 'No answer generated.');
-        setCitations(message.citations || []);
+        const assistantText = message.answer || 'No answer generated.';
+        const assistantCitations: Citation[] = message.citations || [];
+
+        setAnswer(assistantText);
+        setCitations(assistantCitations);
+
         setStatusText('Inference completed locally.');
         setEngineProgress(100);
         setIsInferenceRunning(false);
         setUiError(null);
+
+        // Append assistant to persistent transcript
+        setMessages((current) => {
+          const next: ChatMessage[] = [
+            ...current,
+            {
+              id: `assistant-${Date.now()}`,
+              role: 'assistant',
+              text: assistantText,
+              timestamp: Date.now(),
+              citations: assistantCitations,
+            },
+          ];
+          void chrome.storage?.local.set({ chatHistory: next });
+          return next;
+        });
+
         return;
       }
 
@@ -84,11 +137,13 @@ function App() {
         setUiError(message.error || 'The local engine could not complete the request.');
         setIsInferenceRunning(false);
         setIsResetting(false);
+        return;
       }
 
       if (message.type === 'PURGE_ALL_DATA_SUCCESS') {
         setStatusText('Local memory caches wiped.');
         setUiError(null);
+        return;
       }
     };
 
@@ -96,33 +151,93 @@ function App() {
     return () => chrome.runtime?.onMessage.removeListener(listener);
   }, []);
 
+  // 1) Load persisted history from chrome.storage.local on mount
+  useEffect(() => {
+    const loadChatHistory = async () => {
+      try {
+        const result = await chrome.storage.local.get(['chatHistory']);
+        const storedMessages = Array.isArray(result?.chatHistory) ? result.chatHistory : [];
+
+        const normalized: ChatMessage[] = storedMessages
+          .map((entry: any) => {
+            if (!entry || typeof entry !== 'object') return null;
+            const role = entry.role;
+            if (role !== 'user' && role !== 'assistant') return null;
+            if (typeof entry.text !== 'string') return null;
+            if (typeof entry.id !== 'string') return null;
+            if (typeof entry.timestamp !== 'number') return null;
+
+            const citationsArr: Citation[] = Array.isArray(entry.citations)
+              ? entry.citations
+                  .map((c: any) => {
+                    if (!c || typeof c !== 'object') return null;
+                    if (typeof c.title !== 'string' || typeof c.url !== 'string') return null;
+                    return { title: c.title, url: c.url } as Citation;
+                  })
+                  .filter(Boolean)
+              : [];
+
+            return {
+              id: entry.id,
+              role,
+              text: entry.text,
+              timestamp: entry.timestamp,
+              citations: citationsArr,
+            } satisfies ChatMessage;
+          })
+          .filter(Boolean) as ChatMessage[];
+
+        setMessages(normalized);
+      } catch (error) {
+        console.warn('OmniBrowser AI: failed to load chat history', error);
+      }
+    };
+
+    void loadChatHistory();
+  }, []);
+
   const handleRunInference = () => {
-    if (!inputValue.trim()) {
+    const promptText = inputValue.trim();
+    if (!promptText) {
       setStatusText('Type a question before running the local engine.');
       return;
     }
 
+    // 3) Append user message and persist immediately
+    const userMessage: ChatMessage = {
+      id: `user-${Date.now()}`,
+      role: 'user',
+      text: promptText,
+      timestamp: Date.now(),
+      citations: [],
+    };
+
+    setMessages((current) => {
+      const next = [...current, userMessage];
+      void chrome.storage?.local.set({ chatHistory: next });
+      return next;
+    });
+
     setIsInferenceRunning(true);
     setUiError(null);
     setStatusText('Dispatching local query…');
-    chrome.runtime?.sendMessage(
-      {
-        type: 'RUN_LOCAL_INFERENCE',
-        query: inputValue.trim(),
-      },
-      (response: any) => {
-        if (chrome.runtime.lastError) {
-          setUiError(chrome.runtime.lastError.message || 'The request could not be delivered.');
-          setIsInferenceRunning(false);
-          return;
-        }
 
-        if (response?.status === 'ERROR') {
-          setUiError(response.error || 'Inference failed.');
-          setIsInferenceRunning(false);
-        }
-      },
-    );
+    chrome.runtime?.sendMessage({
+      type: 'RUN_LOCAL_INFERENCE',
+      query: promptText,
+      targetTabIds: selectedTabIds,
+    }, (response: any) => {
+      if (chrome.runtime.lastError) {
+        setUiError(chrome.runtime.lastError.message || 'The request could not be delivered.');
+        setIsInferenceRunning(false);
+        return;
+      }
+
+      if (response?.status === 'ERROR') {
+        setUiError(response.error || 'Inference failed.');
+        setIsInferenceRunning(false);
+      }
+    });
   };
 
   const handleResetEngine = () => {
@@ -161,16 +276,34 @@ function App() {
     });
   };
 
-  const toggleTab = (id: number) => {
-    setTabs((current) =>
-      current.map((item) => (item.id === id ? { ...item, enabled: !item.enabled } : item)),
-    );
+  const handleClearHistory = async () => {
+    setMessages([]);
+    setAnswer('');
+    setCitations([]);
+    setStatusText('Chat history cleared.');
+    setUiError(null);
+    try {
+      await chrome.storage.local.remove(['chatHistory']);
+    } catch (error) {
+      console.warn('OmniBrowser AI: failed to clear chat history', error);
+    }
   };
 
+  // Legacy tab toggle (superseded by selectedTabIds checkboxes)
+  // const toggleTab = (id: number) => {
+  //   setTabs((current) => current.map((item) => (item.id === id ? { ...item, enabled: !item.enabled } : item)));
+  // };
+
   const summary = useMemo(() => {
-    const enabledCount = tabs.filter((item) => item.enabled).length;
-    return `${enabledCount}/${tabs.length} context sources active`;
-  }, [tabs]);
+    // Prefer the dynamic runtime-fed numbers if available
+    if (totalTabs > 0 || indexedTabs > 0) {
+      return `${indexedTabs}/${totalTabs} context sources active`;
+    }
+
+    // No legacy tab model is currently used; show a neutral fallback.
+    return `0/0 context sources active`;
+  }, [totalTabs, indexedTabs]);
+
 
   return (
     <div className="min-h-screen bg-[#080B11] text-slate-100">
@@ -183,13 +316,21 @@ function App() {
                 OmniBrowser AI
               </div>
               <h1 className="text-xl font-semibold text-white">Offline-first browser intelligence workspace</h1>
-              <p className="mt-1 text-sm text-slate-400">
-                Private local RAG across active tabs with WebGPU-backed reasoning.
-              </p>
+              <p className="mt-1 text-sm text-slate-400">Private local RAG across active tabs with WebGPU-backed reasoning.</p>
             </div>
-            <div className="rounded-xl border border-[#8B5CF6]/30 bg-[#8B5CF6]/10 px-3 py-2 text-sm text-[#C4B5FD]">
-              <div className="font-medium">{summary}</div>
-              <div className="text-xs text-slate-400">{statusText}</div>
+
+            <div className="flex items-start gap-2">
+              <button
+                type="button"
+                onClick={handleClearHistory}
+                className="hidden rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm font-medium text-slate-200 transition hover:bg-white/10 sm:inline-flex"
+              >
+                Clear History
+              </button>
+              <div className="rounded-xl border border-[#8B5CF6]/30 bg-[#8B5CF6]/10 px-3 py-2 text-sm text-[#C4B5FD]">
+                <div className="font-medium">{summary}</div>
+                <div className="text-xs text-slate-400">{statusText}</div>
+              </div>
             </div>
           </div>
         </header>
@@ -218,7 +359,11 @@ function App() {
             <button
               key={tab.key}
               type="button"
-              onClick={() => setActiveTab(tab.key as WorkspaceTab)}
+              onClick={() => {
+                if (tab.key === 'chat') setActiveTab('chat');
+                if (tab.key === 'data') setActiveTab('data');
+                if (tab.key === 'settings') setActiveTab('settings');
+              }}
               className={`rounded-xl px-3 py-2 text-sm font-medium transition ${
                 activeTab === tab.key
                   ? 'bg-[#FF6B00] text-white shadow-lg shadow-[#FF6B00]/20'
@@ -234,15 +379,78 @@ function App() {
           {activeTab === 'chat' && (
             <div className="grid gap-3 lg:grid-cols-[1.2fr_0.8fr]">
               <section className="rounded-2xl border border-white/10 bg-[#080B11]/70 p-4">
-                <div className="mb-3 flex items-center justify-between">
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <h2 className="text-lg font-semibold text-white">Conversation cockpit</h2>
                     <p className="text-sm text-slate-400">Ask questions against your local tab memory.</p>
                   </div>
+
+                  <button
+                    type="button"
+                    onClick={handleClearHistory}
+                    className="rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm font-medium text-slate-200 transition hover:bg-white/10 sm:hidden"
+                  >
+                    Clear History
+                  </button>
+
                   <span className="rounded-full border border-[#8B5CF6]/30 bg-[#8B5CF6]/10 px-2.5 py-1 text-xs text-[#C4B5FD]">
                     Local RAG
                   </span>
                 </div>
+
+                {/* 4) Message transcript from persisted `messages` */}
+                <div className="mb-4 max-h-[280px] overflow-y-auto rounded-xl border border-white/10 bg-[#0E1420] p-3">
+                  <div className="mb-2 flex items-center justify-between">
+                    <div className="text-sm font-medium text-slate-300">Chat history</div>
+                    {messages.length > 0 && (
+                      <div className="text-xs text-slate-500">
+                        {messages.length} message{messages.length === 1 ? '' : 's'}
+                      </div>
+                    )}
+                  </div>
+
+                  {messages.length === 0 ? (
+                    <div className="text-sm text-slate-500">No saved messages yet. Your next prompt will be stored locally.</div>
+                  ) : (
+                    <div className="space-y-2">
+                      {messages.map((m) => (
+                        <div
+                          key={m.id}
+                          className={`rounded-xl border px-3 py-2 text-sm ${
+                            m.role === 'user'
+                              ? 'border-[#FF6B00]/20 bg-[#FF6B00]/10 text-slate-100'
+                              : 'border-[#8B5CF6]/20 bg-[#8B5CF6]/10 text-slate-100'
+                          }`}
+                        >
+                          <div className="mb-1 flex items-center justify-between gap-2">
+                            <span className="text-[11px] uppercase tracking-[0.24em] text-slate-400">{m.role === 'user' ? 'You' : 'OmniBrowser AI'}</span>
+                            <span className="text-[11px] text-slate-400">
+                              {new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                            </span>
+                          </div>
+                          <div className="whitespace-pre-wrap leading-6">{m.text}</div>
+                          {m.citations.length > 0 && (
+                            <div className="mt-2 flex flex-wrap gap-2">
+                              {m.citations.map((c) => (
+                                <button
+                                  key={`${c.title}-${c.url}`}
+                                  type="button"
+                                  onClick={() => {
+                                    void chrome.tabs.update({ url: c.url, active: true });
+                                  }}
+                                  className="rounded-full border border-violet-700/50 bg-violet-900/30 px-3 py-1 text-sm text-violet-300 transition hover:bg-violet-800/40"
+                                >
+                                  {c.title}
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
                 <textarea
                   value={inputValue}
                   onChange={(event) => setInputValue(event.target.value)}
@@ -250,6 +458,7 @@ function App() {
                   className="w-full rounded-xl border border-white/10 bg-[#0E1420] px-3 py-3 text-sm text-slate-100 outline-none ring-0 placeholder:text-slate-500"
                   placeholder="Ask OmniBrowser AI anything about your open tabs..."
                 />
+
                 <div className="mt-3 flex flex-wrap items-center gap-2">
                   <button
                     type="button"
@@ -261,6 +470,7 @@ function App() {
                   </button>
                   <span className="text-sm text-slate-500">Works fully offline when the engine is loaded.</span>
                 </div>
+
                 <div className="mt-4 rounded-xl border border-white/10 bg-[#0E1420] p-3">
                   <div className="mb-3 flex items-center justify-between text-sm">
                     <span className="font-medium text-slate-300">Engine compile status</span>
@@ -274,6 +484,8 @@ function App() {
                   </div>
                   <div className="mt-2 text-xs text-slate-500">{statusText}</div>
                 </div>
+
+                {/* Keep the old answer panel for backward consistency */}
                 <div className="mt-4 rounded-xl border border-white/10 bg-[#0E1420] p-3">
                   <div className="mb-2 text-sm font-medium text-slate-300">Answer</div>
                   <div className="min-h-[100px] whitespace-pre-wrap text-sm leading-7 text-slate-200">
@@ -326,26 +538,27 @@ function App() {
                 </div>
               </div>
               <div className="grid gap-2">
-                {tabs.map((item) => (
-                  <button
-                    key={item.id}
-                    type="button"
-                    onClick={() => toggleTab(item.id)}
-                    className={`flex items-center justify-between rounded-xl border px-3 py-3 text-left transition ${
-                      item.enabled
-                        ? 'border-[#8B5CF6]/25 bg-[#8B5CF6]/10 text-slate-100'
-                        : 'border-white/10 bg-[#111622] text-slate-400'
-                    }`}
-                  >
-                    <div>
-                      <div className="font-medium">{item.title}</div>
-                      <div className="text-xs opacity-70">{item.url}</div>
+                {tabMatrixList.length === 0 ? (
+                  <p className="text-xs text-slate-500">No scrapable secure tab indexes found.</p>
+                ) : (
+                  tabMatrixList.map((tab) => (
+                    <div
+                      key={tab.id}
+                      className="flex items-start space-x-3 p-2.5 rounded bg-slate-900/60 border border-slate-800/80 hover:border-purple-900/30 transition"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={selectedTabIds.includes(tab.id)}
+                        onChange={() => handleToggleTab(tab.id)}
+                        className="mt-0.5 accent-orange-500 rounded border-slate-700 bg-slate-800"
+                      />
+                      <div className="flex-1 min-w-0">
+                        <p className="text-xs font-medium text-slate-200 truncate">{tab.title || 'Untitled Tab'}</p>
+                        <p className="text-[10px] text-slate-500 truncate mt-0.5">{tab.url}</p>
+                      </div>
                     </div>
-                    <span className={`rounded-full px-2.5 py-1 text-xs ${item.enabled ? 'bg-[#FF6B00] text-white' : 'bg-[#0E1420] text-slate-500'}`}>
-                      {item.enabled ? 'Included' : 'Excluded'}
-                    </span>
-                  </button>
-                ))}
+                  ))
+                )}
               </div>
             </section>
           )}
@@ -385,9 +598,7 @@ function App() {
 
               <div className="rounded-2xl border border-red-500/20 bg-red-500/10 p-4">
                 <h3 className="text-lg font-semibold text-red-200">Safety controls</h3>
-                <p className="mt-2 text-sm text-red-100/80">
-                  This purge clears local retrieval caches and resets the in-memory workspace state.
-                </p>
+                <p className="mt-2 text-sm text-red-100/80">This purge clears local retrieval caches and resets the in-memory workspace state.</p>
                 <button
                   type="button"
                   onClick={() => setIsConfirmOpen(true)}
@@ -432,3 +643,4 @@ function App() {
 }
 
 export default App;
+
