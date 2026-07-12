@@ -28,6 +28,13 @@ export default defineConfig({
           name: 'crxjs-rewrite-manifest-background',
           closeBundle: () => {
             const manifestPath = resolve(__dirname, 'dist/manifest.json');
+            const sourceManifestPath = resolve(__dirname, 'manifest.json');
+
+            if (!fs.existsSync(manifestPath)) {
+              fs.mkdirSync(resolve(__dirname, 'dist'), { recursive: true });
+              fs.copyFileSync(sourceManifestPath, manifestPath);
+            }
+
             const raw = fs.readFileSync(manifestPath, 'utf8');
             const manifest = JSON.parse(raw);
 

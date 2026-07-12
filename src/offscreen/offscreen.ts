@@ -112,7 +112,7 @@ async function initLLMEngine(): Promise<any> {
   isEngineInitializing = true;
 
   try {
-    const targetModel = 'Llama-3.2-1B-Instruct-q4f16_1-MLC';
+    const targetModel = "Qwen2-0.5B-Instruct-q4f16_1-MLC";
     llmEnginePromise = CreateMLCEngine(targetModel, {
       initProgressCallback: (progress: { text: string }) => {
         void sendRuntimeMessage({ type: 'ENGINE_COMPILE_STATUS', status: progress.text });
