@@ -372,9 +372,5 @@ Contributions are welcome.
 - Keep the message protocol stable unless you update all components.
 - When changing the runtime model, update the target model string in `src/offscreen/offscreen.ts`.
 
----
 
-## License
-
-Add your project license here (not present in the repository content currently). 
 
